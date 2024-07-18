@@ -18,8 +18,14 @@
 
 package flinkExplore;
 
+import objects.Customer;
 import objects.Transaction;
+import objects.CustomerTransaction;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.functions.FlatMapFunction;
+import org.apache.flink.api.common.state.ValueState;
+import org.apache.flink.api.common.state.ValueStateDescriptor;
+import org.apache.flink.configuration.Configuration;
 import org.apache.flink.connector.base.DeliveryGuarantee;
 import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema;
 import org.apache.flink.connector.kafka.sink.KafkaSink;
@@ -27,13 +33,13 @@ import org.apache.flink.connector.kafka.source.KafkaSource;
 import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import serdes.JSONDeserializationSchema;
+import org.apache.flink.streaming.api.functions.co.RichCoFlatMapFunction;
+import org.apache.flink.streaming.api.functions.sink.SinkFunction;
+import org.apache.flink.util.Collector;
+import serdes.CustomerJSONDeserializationSchema;
+import serdes.CustomerTransactionJSONSerializationSchema;
+import serdes.TransactionJSONDeserializationSchema;
 import serdes.JSONSerializationSchema;
-
-import java.io.FileInputStream;
-import java.io.FileNotFoundException;
-import java.io.IOException;
-import java.util.Properties;
 
 /**
  * Skeleton for a Flink DataStream Job.
@@ -94,37 +100,100 @@ public class DataStreamJob {
 		 */
 
 		// Kafka Constants
-		final String KAFKA_BOOTRSTRAP_SERVER = "broker:29092";
-		final String KAFKA_TOPIC_INPUT = "customer_transactions";
-		final String KAFKA_TOPIC_OUTPUT = "customer_transactions_current_state";
+		final String KAFKA_BOOTRSTRAP_SERVER = "localhost:9092";
+		final String KAFKA_TOPIC_TRANSACTIONS = "transactions_topic";
+		final String KAFKA_TOPIC_CUSTOMER = "customer_topic";
+		final String KAFKA_TOPIC_OUTPUT = "customer_transactions_topic";
 		final String FLINK_GROUP_ID = "FLINK_GROUP_ID";
 
-		// Setup KafkaSource
-		KafkaSource<Transaction> source = KafkaSource.<Transaction>builder()
+		// Setup Kafka Source's
+		KafkaSource<Transaction> transactionSource = KafkaSource.<Transaction>builder()
 				.setBootstrapServers(KAFKA_BOOTRSTRAP_SERVER)
-				.setTopics(KAFKA_TOPIC_INPUT)
+				.setTopics(KAFKA_TOPIC_TRANSACTIONS)
 				.setGroupId(FLINK_GROUP_ID)
 				.setStartingOffsets(OffsetsInitializer.earliest())
-				.setValueOnlyDeserializer(new JSONDeserializationSchema())
+				.setValueOnlyDeserializer(new TransactionJSONDeserializationSchema())
 				.build();
 
-		DataStream<Transaction> transactionStream = env.fromSource(source, WatermarkStrategy.noWatermarks(), "Kafka Topic Customer Transactions") ;
-		transactionStream.print();
+		KafkaSource<Customer> customerSource = KafkaSource.<Customer>builder()
+				.setBootstrapServers(KAFKA_BOOTRSTRAP_SERVER)
+				.setTopics(KAFKA_TOPIC_CUSTOMER)
+				.setGroupId(FLINK_GROUP_ID)
+				.setStartingOffsets(OffsetsInitializer.earliest())
+				.setValueOnlyDeserializer(new CustomerJSONDeserializationSchema())
+				.build();
 
 		// Setup KafkaSink
-		KafkaSink<Transaction> sink = KafkaSink.<Transaction>builder()
+		KafkaSink<CustomerTransaction> sink = KafkaSink.<CustomerTransaction>builder()
 				.setBootstrapServers(KAFKA_BOOTRSTRAP_SERVER)
 				.setRecordSerializer(KafkaRecordSerializationSchema.builder()
 						.setTopic(KAFKA_TOPIC_OUTPUT)
-						.setValueSerializationSchema(new JSONSerializationSchema())
+						.setValueSerializationSchema(new CustomerTransactionJSONSerializationSchema())
 						.build())
 				.setDeliveryGuarantee(DeliveryGuarantee.AT_LEAST_ONCE)
 				.build();
 
-		// Stream to sink
-		transactionStream.sinkTo(sink);
+		// DataStreams Setup
+		DataStream<Transaction> transactionStream = env.fromSource(transactionSource, WatermarkStrategy.noWatermarks(), "Kafka Transactions").keyBy(transaction -> transaction.getCustomerId());
+		DataStream<Customer> customerStream = env.fromSource(customerSource, WatermarkStrategy.noWatermarks(), "Kafka Transactions").keyBy(customer -> customer.getCustomerId()) ;
+
+		// Join Transaction on customer to enrich data
+		transactionStream.connect(customerStream).flatMap(new EnrichmentFunction()).sinkTo(sink);
+
+		transactionStream.print();
 
 		// Execute program, beginning computation.
 		env.execute("Kafka Flink Explore Job started!");
+	}
+	
+	public static class EnrichmentFunction
+			extends RichCoFlatMapFunction<Transaction, Customer, CustomerTransaction> {
+
+		// Defining the states
+		private ValueState<Transaction> transactionState;
+		private ValueState<Customer> customerState;
+
+		@Override
+		public void open(Configuration config) throws Exception {
+			// Defining the descriptions of these states and info on how to serialize  these objects
+			transactionState = getRuntimeContext().getState(new ValueStateDescriptor<>("Saved Transaction", Transaction.class));
+			customerState = getRuntimeContext().getState(new ValueStateDescriptor<>("Saved Customer", Customer.class));
+
+		}
+
+		/* Logic: for flatMap2() and infer for flatMap1()
+		 *   The order of arrival of transaction and customer is not something we have control over.
+		 *   So, currently processing a fare with some ride_id, there could be the case where
+		 *   ride with the same ride_id has not arrived yet. In this case we will have to wait
+		 *   for the ride. So, that's where customerState comes into play, we can store the current
+		 *   fare in customerState and have it processed later whenever that ride arrives.
+		 *   Thus, the logic get ride from transactionState, if it's not present then add the current
+		 *   fare to customerState. Else, if it is present remove it from the state and add it to
+		 *   the output.
+		 *   Same for flatMap1()
+		 * */
+		@Override
+		public void flatMap1(Transaction transaction, Collector<CustomerTransaction> out) throws Exception {
+			Customer customer = customerState.value();
+			if (customer == null) {
+				transactionState.update(transaction);
+			}
+			else {
+				customerState.clear();
+				out.collect(new CustomerTransaction(customer, transaction));
+			}
+		}
+
+		@Override
+		public void flatMap2(Customer customer, Collector<CustomerTransaction> out) throws Exception {
+			Transaction transaction = transactionState.value();
+			if (transaction == null) {
+				customerState.update(customer);
+			}
+			else {
+				transactionState.clear();
+				out.collect(new CustomerTransaction(customer, transaction));
+			}
+		}
 	}
 }
