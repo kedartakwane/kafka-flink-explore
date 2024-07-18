@@ -5,7 +5,7 @@
 
 ## Kafka
 ## Setup
-- Check `docker-compose.yml`
+- Check [docker-compose.yml](/docker-compose.yml)
 
 ## Flink 
 ### Setup
@@ -13,7 +13,7 @@
 - Download Apache Flink from https://flink.apache.org/downloads/
 - Extract the compressed file
 - Go to the root folder
-- Can change the config file like adding more increasing `taskmanager.numberOfTaskSlots` and `parallelism.default` properties.
+- Can change the config file `flink_root/conf/flink-conf.yml` like adding more increasing `taskmanager.numberOfTaskSlots` and `parallelism.default` properties.
 - Start the cluster:
 ```bash
 ./bin/start-cluster.sh
@@ -24,7 +24,7 @@
 ./bin/stop-cluster.sh
 ``` 
 #### Docker
-- Check the `docker-compose.yml`
+- Check the [docker-compose.yml](/docker-compose.yml)
 
 ### Creating project using Intellij
 Follow this:
