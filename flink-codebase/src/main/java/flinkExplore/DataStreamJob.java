@@ -19,21 +19,21 @@
 package flinkExplore;
 
 import objects.Customer;
-import objects.Transaction;
 import objects.CustomerTransaction;
+import objects.FraudTransaction;
+import objects.Transaction;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
-import org.apache.flink.api.common.functions.AggregateFunction;
 import org.apache.flink.api.common.functions.FilterFunction;
 import org.apache.flink.api.common.functions.MapFunction;
 import org.apache.flink.api.common.functions.ReduceFunction;
 import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.java.tuple.Tuple2;
-import org.apache.flink.api.java.tuple.Tuple3;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.connector.base.DeliveryGuarantee;
 import org.apache.flink.connector.jdbc.JdbcConnectionOptions;
 import org.apache.flink.connector.jdbc.JdbcExecutionOptions;
+import org.apache.flink.connector.jdbc.JdbcSink;
 import org.apache.flink.connector.jdbc.JdbcStatementBuilder;
 import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema;
 import org.apache.flink.connector.kafka.sink.KafkaSink;
@@ -42,18 +42,13 @@ import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsIni
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.co.RichCoFlatMapFunction;
-import org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction;
-import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
 import org.apache.flink.streaming.api.windowing.assigners.TumblingProcessingTimeWindows;
 import org.apache.flink.streaming.api.windowing.time.Time;
-import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.util.Collector;
 import serdes.CustomerJSONDeserializationSchema;
 import serdes.CustomerTransactionJSONSerializationSchema;
+import serdes.FraudTransactionJSONDeserializationSchema;
 import serdes.TransactionJSONDeserializationSchema;
-import org.apache.flink.connector.jdbc.JdbcSink;
-
-import java.time.Duration;
 
 /**
  * Skeleton for a Flink DataStream Job.
@@ -117,6 +112,7 @@ public class DataStreamJob {
 		final String KAFKA_BOOTRSTRAP_SERVER = "localhost:9092";
 		final String KAFKA_TOPIC_TRANSACTIONS = "transactions_topic";
 		final String KAFKA_TOPIC_CUSTOMER = "customer_topic";
+		final String KAFKA_TOPIC_FRAUD_TRANSACTIONS = "fraud_transactions_topic";
 		final String KAFKA_TOPIC_OUTPUT = "customer_transactions_topic";
 		final String FLINK_GROUP_ID = "FLINK_GROUP_ID";
 
@@ -142,6 +138,14 @@ public class DataStreamJob {
 				.setValueOnlyDeserializer(new CustomerJSONDeserializationSchema())
 				.build();
 
+		KafkaSource<FraudTransaction> fraudTransactionSource = KafkaSource.<FraudTransaction>builder()
+				.setBootstrapServers(KAFKA_BOOTRSTRAP_SERVER)
+				.setTopics(KAFKA_TOPIC_FRAUD_TRANSACTIONS)
+				.setGroupId(FLINK_GROUP_ID)
+				.setStartingOffsets(OffsetsInitializer.earliest())
+				.setValueOnlyDeserializer(new FraudTransactionJSONDeserializationSchema())
+				.build();
+
 		// Setup KafkaSink
 		KafkaSink<CustomerTransaction> sink = KafkaSink.<CustomerTransaction>builder()
 				.setBootstrapServers(KAFKA_BOOTRSTRAP_SERVER)
@@ -155,6 +159,7 @@ public class DataStreamJob {
 		// DataStreams Setup
 		DataStream<Transaction> transactionStream = env.fromSource(transactionSource, WatermarkStrategy.noWatermarks(), "Kafka Transactions Topic").keyBy(transaction -> transaction.getCustomerId());
 		DataStream<Customer> customerStream = env.fromSource(customerSource, WatermarkStrategy.noWatermarks(), "Kafka Customer Topic").keyBy(customer -> customer.getCustomerId());
+		DataStream<FraudTransaction> fraudTransactionStream = env.fromSource(fraudTransactionSource, WatermarkStrategy.noWatermarks(), "Kafka Fraud Transactions Topic").keyBy(transaction -> transaction.getReceiptId());
 
 		// Window function to calculate totalAmount per customer per 10 seconds
 		// Does not need a Watermark Strategy but for exploration added it as a new DataStream!
@@ -193,7 +198,7 @@ public class DataStreamJob {
 		// Write to CustomerTransaction Topic
 		customerTransactionDataStream.sinkTo(sink);
 
-		// Write to Postgres Customer_Transaction Table
+		// Write to Postgres Transactions Table
 		JdbcExecutionOptions executionOptions = new JdbcExecutionOptions.Builder()
 				.withBatchSize(1000)
 				.withBatchIntervalMs(200)
@@ -207,36 +212,92 @@ public class DataStreamJob {
 				.withPassword(POSTGRES_PASSWORD)
 				.build();
 
-		String sqlQuery = "CREATE TABLE IF NOT EXISTS Customer_Transactions (" +
-							"receipt_id VARCHAR PRIMARY KEY," +
-							"customer_id VARCHAR," +
-							"product_id VARCHAR, " +
-							"product_name VARCHAR, " +
-							"product_price DOUBLE PRECISION, " +
-							"product_quantity INTEGER, " +
-							"total_amount DOUBLE PRECISION, " +
-							"receipt_date TIMESTAMP, " +
-							"payment_method VARCHAR, " +
-							"customer_name VARCHAR, " +
-							"customer_email VARCHAR, " +
-							"customer_birthdate VARCHAR" +
-							")"
+		// Postgres Table Creation
+		String sqlQuery = "CREATE TABLE IF NOT EXISTS Raw_Transactions (" +
+				"receipt_id VARCHAR PRIMARY KEY," +
+				"customer_id VARCHAR," +
+				"product_id VARCHAR, " +
+				"product_name VARCHAR, " +
+				"product_price DOUBLE PRECISION, " +
+				"product_quantity INTEGER, " +
+				"total_amount DOUBLE PRECISION, " +
+				"receipt_date TIMESTAMP, " +
+				"payment_method VARCHAR" +
+				")"
 				;
 
-		customerTransactionDataStream.addSink(JdbcSink.sink(
+		transactionStream.addSink(JdbcSink.sink(
 				sqlQuery,
-				(JdbcStatementBuilder<CustomerTransaction>) (preparedState, customerTransaction) -> {
+				(JdbcStatementBuilder<Transaction>) (preparedState, transaction) -> {
 
 				},
 				executionOptions,
 				connectionOptions
-		)).name("Create Customer Transaction Table Sink!");
+		)).name("Created Raw_Transactions Table Sink!");
 
-		customerTransactionDataStream.addSink(JdbcSink.sink(
-				"INSERT INTO Customer_Transactions (receipt_id, customer_id, product_id, product_name, " +
-					"product_price, product_quantity, total_amount, receipt_date, payment_method, " +
-					"customer_name, customer_email, customer_birthdate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)" +
-					"ON CONFLICT (receipt_id) DO UPDATE SET " +
+		String sqlQuery2 = "CREATE TABLE IF NOT EXISTS Customer (" +
+				"customer_id VARCHAR PRIMARY KEY," +
+				"name VARCHAR, " +
+				"email VARCHAR, " +
+				"birthdate VARCHAR" +
+				")"
+				;
+
+		customerStream.addSink(JdbcSink.sink(
+				sqlQuery2,
+				(JdbcStatementBuilder<Customer>) (preparedState, transaction) -> {
+
+				},
+				executionOptions,
+				connectionOptions
+		)).name("Created Customer Table Sink!");
+
+		String sqlQuery3 = "CREATE TABLE IF NOT EXISTS Fraud_Transactions (" +
+				"receipt_id VARCHAR PRIMARY KEY," +
+				"detected_ts TIMESTAMP" +
+				")"
+				;
+
+		fraudTransactionStream.addSink(JdbcSink.sink(
+				sqlQuery3,
+				(JdbcStatementBuilder<FraudTransaction>) (preparedState, transaction) -> {
+
+				},
+				executionOptions,
+				connectionOptions
+		)).name("Created Fraud_Transactions Table Sink!");
+
+//		String sqlQuery4 = "CREATE TABLE IF NOT EXISTS Customer_Transactions (" +
+//				"receipt_id VARCHAR PRIMARY KEY," +
+//				"customer_id VARCHAR," +
+//				"product_id VARCHAR, " +
+//				"product_name VARCHAR, " +
+//				"product_price DOUBLE PRECISION, " +
+//				"product_quantity INTEGER, " +
+//				"total_amount DOUBLE PRECISION, " +
+//				"receipt_date TIMESTAMP, " +
+//				"payment_method VARCHAR, " +
+//				"customer_name VARCHAR, " +
+//				"customer_email VARCHAR, " +
+//				"customer_birthdate VARCHAR" +
+//				")"
+//				;
+//
+//		customerTransactionDataStream.addSink(JdbcSink.sink(
+//				sqlQuery4,
+//				(JdbcStatementBuilder<CustomerTransaction>) (preparedState, customerTransaction) -> {
+//
+//				},
+//				executionOptions,
+//				connectionOptions
+//		)).name("Create Customer_Transactions Table Sink!");
+
+		// Inserting records to Postgres
+		transactionStream.addSink(JdbcSink.sink(
+				"INSERT INTO Raw_Transactions (receipt_id, customer_id, product_id, product_name, " +
+						"product_price, product_quantity, total_amount, receipt_date, payment_method) " +
+						"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)" +
+						"ON CONFLICT (receipt_id) DO UPDATE SET " +
 						"receipt_id = EXCLUDED.receipt_id, " +
 						"customer_id = EXCLUDED.customer_id, " +
 						"product_id = EXCLUDED.product_id, " +
@@ -245,27 +306,91 @@ public class DataStreamJob {
 						"product_quantity = EXCLUDED.product_quantity, " +
 						"total_amount = EXCLUDED.total_amount, " +
 						"receipt_date = EXCLUDED.receipt_date, " +
-						"payment_method = EXCLUDED.payment_method, " +
-						"customer_name = EXCLUDED.customer_name, " +
-						"customer_email = EXCLUDED.customer_email, " +
-						"customer_birthdate = EXCLUDED.customer_birthdate",
-				(JdbcStatementBuilder<CustomerTransaction>) (preparedStatement, customerTransaction) -> {
-					preparedStatement.setString(1, customerTransaction.getReceiptId());
-					preparedStatement.setString(2, customerTransaction.getCustomerId());
-					preparedStatement.setString(3, customerTransaction.getProductId());
-					preparedStatement.setString(4, customerTransaction.getProductName());
-					preparedStatement.setDouble(5, customerTransaction.getProductPrice());
-					preparedStatement.setInt(6, customerTransaction.getProductQuantity());
-					preparedStatement.setDouble(7, customerTransaction.getTotalAmount());
-					preparedStatement.setTimestamp(8, customerTransaction.getReceiptDate());
-					preparedStatement.setString(9, customerTransaction.getPaymentMethod());
-					preparedStatement.setString(10, customerTransaction.getCustomerName());
-					preparedStatement.setString(11, customerTransaction.getCustomerEmail());
-					preparedStatement.setString(12, customerTransaction.getCustomerBirthdate());
+						"payment_method = EXCLUDED.payment_method"
+				,
+				(JdbcStatementBuilder<Transaction>) (preparedStatement, transaction) -> {
+					preparedStatement.setString(1, transaction.getReceiptId());
+					preparedStatement.setString(2, transaction.getCustomerId());
+					preparedStatement.setString(3, transaction.getProductId());
+					preparedStatement.setString(4, transaction.getProductName());
+					preparedStatement.setDouble(5, transaction.getProductPrice());
+					preparedStatement.setInt(6, transaction.getProductQuantity());
+					preparedStatement.setDouble(7, transaction.getTotalAmount());
+					preparedStatement.setTimestamp(8, transaction.getReceiptDate());
+					preparedStatement.setString(9, transaction.getPaymentMethod());
 				},
 				executionOptions,
 				connectionOptions
-		)).name("Insert into CustomerTransaction table Sink");
+		)).name("Inserted into Raw_Transactions Table Sink");
+
+		customerStream.addSink(JdbcSink.sink(
+				"INSERT INTO Customer (customer_id, name, email, birthdate) " +
+						"VALUES (?, ?, ?, ?)" +
+						"ON CONFLICT (customer_id) DO UPDATE SET " +
+						"customer_id = EXCLUDED.customer_id, " +
+						"name = EXCLUDED.name, " +
+						"email = EXCLUDED.email, " +
+						"birthdate = EXCLUDED.birthdate"
+				,
+				(JdbcStatementBuilder<Customer>) (preparedStatement, customer) -> {
+					preparedStatement.setString(1, customer.getCustomerId());
+					preparedStatement.setString(2, customer.getName());
+					preparedStatement.setString(3, customer.getEmail());
+					preparedStatement.setString(4, customer.getBirthdate());
+				},
+				executionOptions,
+				connectionOptions
+		)).name("Inserted into Customer Table Sink");
+
+		fraudTransactionStream.addSink(JdbcSink.sink(
+				"INSERT INTO Fraud_Transactions (receipt_id, detected_ts) " +
+						"VALUES (?, ?)" +
+						"ON CONFLICT (receipt_id) DO UPDATE SET " +
+						"receipt_id = EXCLUDED.receipt_id, " +
+						"detected_ts = EXCLUDED.detected_ts"
+				,
+				(JdbcStatementBuilder<FraudTransaction>) (preparedStatement, transaction) -> {
+					preparedStatement.setString(1, transaction.getReceiptId());
+					preparedStatement.setTimestamp(2, transaction.getDetectedTs());
+				},
+				executionOptions,
+				connectionOptions
+		)).name("Inserted into Fraud_Transactions Table Sink");
+
+//		customerTransactionDataStream.addSink(JdbcSink.sink(
+//				"INSERT INTO Customer_Transactions (receipt_id, customer_id, product_id, product_name, " +
+//						"product_price, product_quantity, total_amount, receipt_date, payment_method, " +
+//						"customer_name, customer_email, customer_birthdate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)" +
+//						"ON CONFLICT (receipt_id) DO UPDATE SET " +
+//						"receipt_id = EXCLUDED.receipt_id, " +
+//						"customer_id = EXCLUDED.customer_id, " +
+//						"product_id = EXCLUDED.product_id, " +
+//						"product_name = EXCLUDED.product_name, " +
+//						"product_price = EXCLUDED.product_price, " +
+//						"product_quantity = EXCLUDED.product_quantity, " +
+//						"total_amount = EXCLUDED.total_amount, " +
+//						"receipt_date = EXCLUDED.receipt_date, " +
+//						"payment_method = EXCLUDED.payment_method, " +
+//						"customer_name = EXCLUDED.customer_name, " +
+//						"customer_email = EXCLUDED.customer_email, " +
+//						"customer_birthdate = EXCLUDED.customer_birthdate",
+//				(JdbcStatementBuilder<CustomerTransaction>) (preparedStatement, customerTransaction) -> {
+//					preparedStatement.setString(1, customerTransaction.getReceiptId());
+//					preparedStatement.setString(2, customerTransaction.getCustomerId());
+//					preparedStatement.setString(3, customerTransaction.getProductId());
+//					preparedStatement.setString(4, customerTransaction.getProductName());
+//					preparedStatement.setDouble(5, customerTransaction.getProductPrice());
+//					preparedStatement.setInt(6, customerTransaction.getProductQuantity());
+//					preparedStatement.setDouble(7, customerTransaction.getTotalAmount());
+//					preparedStatement.setTimestamp(8, customerTransaction.getReceiptDate());
+//					preparedStatement.setString(9, customerTransaction.getPaymentMethod());
+//					preparedStatement.setString(10, customerTransaction.getCustomerName());
+//					preparedStatement.setString(11, customerTransaction.getCustomerEmail());
+//					preparedStatement.setString(12, customerTransaction.getCustomerBirthdate());
+//				},
+//				executionOptions,
+//				connectionOptions
+//		)).name("Insert into Customer_Transactions Table Sink");
 
 		// Execute program, beginning computation.
 		env.execute("Kafka Flink Explore Job started!");
@@ -304,7 +429,6 @@ public class DataStreamJob {
 				transactionState.update(transaction);
 			}
 			else {
-				customerState.clear();
 				out.collect(new CustomerTransaction(customer, transaction));
 			}
 		}
@@ -319,27 +443,6 @@ public class DataStreamJob {
 				transactionState.clear();
 				out.collect(new CustomerTransaction(customer, transaction));
 			}
-		}
-	}
-
-	public static class SumAmountSpend extends ProcessWindowFunction<
-			Transaction,                  // input type
-			Tuple3<String, Long, Float>,  // output type
-			String,                         // key type
-			TimeWindow> {                   // window type
-
-		@Override
-		public void process(
-				String key,
-				Context context,
-				Iterable<Transaction> transactions,
-				Collector<Tuple3<String, Long, Float>> out) {
-
-			float totalAmountSpend = 0;
-			for (Transaction transaction : transactions) {
-				totalAmountSpend += transaction.getTotalAmount();
-			}
-			out.collect(Tuple3.of(key, context.window().getEnd(), totalAmountSpend));
 		}
 	}
 
