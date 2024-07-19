@@ -22,8 +22,13 @@ import objects.Customer;
 import objects.Transaction;
 import objects.CustomerTransaction;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.functions.AggregateFunction;
+import org.apache.flink.api.common.functions.FilterFunction;
+import org.apache.flink.api.common.functions.MapFunction;
+import org.apache.flink.api.common.functions.ReduceFunction;
 import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
+import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.api.java.tuple.Tuple3;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.connector.base.DeliveryGuarantee;
@@ -39,6 +44,7 @@ import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.co.RichCoFlatMapFunction;
 import org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction;
 import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
+import org.apache.flink.streaming.api.windowing.assigners.TumblingProcessingTimeWindows;
 import org.apache.flink.streaming.api.windowing.time.Time;
 import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.util.Collector;
@@ -148,7 +154,38 @@ public class DataStreamJob {
 
 		// DataStreams Setup
 		DataStream<Transaction> transactionStream = env.fromSource(transactionSource, WatermarkStrategy.noWatermarks(), "Kafka Transactions Topic").keyBy(transaction -> transaction.getCustomerId());
-		DataStream<Customer> customerStream = env.fromSource(customerSource, WatermarkStrategy.noWatermarks(), "Kafka Customer Topic").keyBy(customer -> customer.getCustomerId()) ;
+		DataStream<Customer> customerStream = env.fromSource(customerSource, WatermarkStrategy.noWatermarks(), "Kafka Customer Topic").keyBy(customer -> customer.getCustomerId());
+
+		// Window function to calculate totalAmount per customer per 10 seconds
+		// Does not need a Watermark Strategy but for exploration added it as a new DataStream!
+		DataStream<Transaction> transactionStream2 = env.fromSource(transactionSource,
+				WatermarkStrategy.<Transaction>forMonotonousTimestamps()
+						.withTimestampAssigner(
+								((transaction, l) -> transaction.getReceiptDate().getTime())
+						),
+				"Kafka Transactions Topic");
+		DataStream<Tuple2<String, Double>> ds = transactionStream2
+				// Filter out objects that are null
+				.filter(new FilterFunction<Transaction>() {
+					@Override
+					public boolean filter(Transaction transaction) throws Exception {
+						return transaction != null;
+					}
+				})
+				.map( new MapFunction<Transaction, Tuple2<String, Double>>() {
+						  @Override
+						  public Tuple2<String, Double> map(Transaction transaction) throws Exception {
+								  String customerId = transaction.getCustomerId();
+								  double totalAmount = transaction.getTotalAmount();
+								  return new Tuple2<>(customerId, totalAmount);
+						  }
+					  }
+				)
+				// KeyBy customerId
+				.keyBy(tuple2 -> tuple2.f0)
+				.window(TumblingProcessingTimeWindows.of(Time.seconds(10)))
+				.reduce(new SumReduce());
+		ds.print();
 
 		// Join Transaction on customer to enrich data and put it in new DataStream
 		DataStream<CustomerTransaction> customerTransactionDataStream = transactionStream.connect(customerStream).flatMap(new EnrichmentFunction());
@@ -305,4 +342,14 @@ public class DataStreamJob {
 			out.collect(Tuple3.of(key, context.window().getEnd(), totalAmountSpend));
 		}
 	}
+
+	private static class SumReduce
+			implements ReduceFunction<Tuple2<String, Double>> {
+
+		@Override
+		public Tuple2<String, Double> reduce(Tuple2<String, Double> t1, Tuple2<String, Double> t2) throws Exception {
+			return t1 != null && t2 != null ? new Tuple2<>(t1.f0, t1.f1 + t2.f1): new Tuple2<>("test", 0D);
+		}
+	}
+
 }
