@@ -1,50 +1,35 @@
 # Exploring Kafka Flink
 
-## Data Pipeline
+## Overview
+This project involves a sophisticated data pipeline designed to handle, process, and analyze transactions from simulated customers to identify fraudulent activities and generate actionable insights. It integrates multiple technologies including Kafka, Flink, and PostgreSQL, with a focus on performance and scalability.
+
+## System Architecture
+This section breaks down the pipeline into its core components, explaining their roles and interactions within the system.
 ![Arch](/pipeline-architecture.png)
 
-## Kafka
-## Setup
-- Check [docker-compose.yml](/docker-compose.yml)
+### Data Generation Module
+- **Purpose**: Generates mock data for customers and transactions, simulating a real-world stream of data.
+- **Tools Used**: Utilizes the `confluent_kafka` library and `faker` to produce realistic customer and transaction data in JSON format.
+- **Concurrency**: Employs multi-threading to accelerate data generation, ensuring high throughput in data production to Kafka topics.
 
-## Flink 
-### Setup
-#### Locally
-- Download Apache Flink from https://flink.apache.org/downloads/
-- Extract the compressed file
-- Go to the root folder
-- Can change the config file `flink_root/conf/flink-conf.yml` like adding more increasing `taskmanager.numberOfTaskSlots` and `parallelism.default` properties.
-- Start the cluster:
-```bash
-./bin/start-cluster.sh
-```
-- Open the Flink Dashboard: http://localhost:8081
-- Stop the cluster:
-```bash
-./bin/stop-cluster.sh
-``` 
-#### Docker
-- Check the [docker-compose.yml](/docker-compose.yml)
+### Kafka Integration
+- **Role**: Serves as the central event streaming platform for all generated events, including customer data and transactions.
+- **Scalability**: Configured to efficiently handle high volumes of data while providing robust data integrity and availability.
 
-### Creating project using Intellij
-Follow this:
-![Creating new Flink Project](/extras/images/Flink-Project-Creation.png)
+### Flink Processing Engine
+- **Data Streaming**: Utilizes `flink-connector-kafka` to ingest data from Kafka topics continuously.
+- **Windowing Functions**: Implements a 10-second tumbling window to compute total spending per customer, providing near-real-time financial analytics.
+- **Data Enrichment**: Enriches transaction streams with customer details (name, email, birthdate) absent from the initial transaction feed by merging data streams before pushing the enriched data back to Kafka.
 
-### Testing
-- Make sure the the Flink cluster is up and running
-- Create jar:
-```bash
-# Erase target folder
-mvn clean
-# Compile to check for error
-mvn compile
-# Create jar
-mvn package
-```
-- Running the Flink job:
-```bash
-[path/to/downloaded_flink_in_setup] run -c [packageName.JavaFileName] [path/to/jar]
+### PostgreSQL Database
+- **Data Storage**: Acts as the sink for all processed data, storing enriched transactions and customer information.
+- **Analytics**: Positioned to support further analytical queries and reporting needs.
 
-# Sample
-/Users/kedartakwane/Developer/local/flink/flink-1.18.1/bin/flink run -c flinkExplore.DataStreamJob target/flink-data-processing-1.0-SNAPSHOT.jar
-```
+## Future Enhancements
+- **Data Deduplication**: Introduce mechanisms to deduplicate transaction data to clean up the dataset, removing any fraudulent transactions.
+- **Business Intelligence Integration**: Connect with a BI tool such as Tableau to visualize key metrics, such as monthly customer expenditure and identifying peak transaction periods.
+- **Observability Suite**: Implement a comprehensive observability platform to monitor the pipeline's performance and health, including logging, metrics, and KPI tracking.
+- **Compliance and Reporting**: Consider adding modules for compliance tracking and automated reporting to meet industry standards and regulatory requirements.
+
+## Conclusion
+The pipeline is designed with extensibility in mind, ready to integrate additional modules for advanced analytics and enhanced monitoring, supporting continuous improvement and operational excellence.
