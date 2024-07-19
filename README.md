@@ -1,4 +1,4 @@
-# Exploring Kafka Flink
+# StreamFleet: An ETL pipeline using Kafka & Flink
 
 ## Overview
 This project involves a sophisticated data pipeline designed to handle, process, and analyze transactions from simulated customers to identify fraudulent activities and generate actionable insights. It integrates multiple technologies including Kafka, Flink, and PostgreSQL, with a focus on performance and scalability.
