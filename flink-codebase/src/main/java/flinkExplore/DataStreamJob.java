@@ -22,11 +22,14 @@ import objects.Customer;
 import objects.Transaction;
 import objects.CustomerTransaction;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
-import org.apache.flink.api.common.functions.FlatMapFunction;
 import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
+import org.apache.flink.api.java.tuple.Tuple3;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.connector.base.DeliveryGuarantee;
+import org.apache.flink.connector.jdbc.JdbcConnectionOptions;
+import org.apache.flink.connector.jdbc.JdbcExecutionOptions;
+import org.apache.flink.connector.jdbc.JdbcStatementBuilder;
 import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema;
 import org.apache.flink.connector.kafka.sink.KafkaSink;
 import org.apache.flink.connector.kafka.source.KafkaSource;
@@ -34,12 +37,17 @@ import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsIni
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.co.RichCoFlatMapFunction;
-import org.apache.flink.streaming.api.functions.sink.SinkFunction;
+import org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction;
+import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
+import org.apache.flink.streaming.api.windowing.time.Time;
+import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.util.Collector;
 import serdes.CustomerJSONDeserializationSchema;
 import serdes.CustomerTransactionJSONSerializationSchema;
 import serdes.TransactionJSONDeserializationSchema;
-import serdes.JSONSerializationSchema;
+import org.apache.flink.connector.jdbc.JdbcSink;
+
+import java.time.Duration;
 
 /**
  * Skeleton for a Flink DataStream Job.
@@ -106,6 +114,11 @@ public class DataStreamJob {
 		final String KAFKA_TOPIC_OUTPUT = "customer_transactions_topic";
 		final String FLINK_GROUP_ID = "FLINK_GROUP_ID";
 
+		// Postgres Constants
+		final String JDBC_URL = "jdbc:postgresql://localhost:5432/postgres";
+		final String POSTGRES_USERNAME = "postgres";
+		final String POSTGRES_PASSWORD = "postgres";
+
 		// Setup Kafka Source's
 		KafkaSource<Transaction> transactionSource = KafkaSource.<Transaction>builder()
 				.setBootstrapServers(KAFKA_BOOTRSTRAP_SERVER)
@@ -134,13 +147,88 @@ public class DataStreamJob {
 				.build();
 
 		// DataStreams Setup
-		DataStream<Transaction> transactionStream = env.fromSource(transactionSource, WatermarkStrategy.noWatermarks(), "Kafka Transactions").keyBy(transaction -> transaction.getCustomerId());
-		DataStream<Customer> customerStream = env.fromSource(customerSource, WatermarkStrategy.noWatermarks(), "Kafka Transactions").keyBy(customer -> customer.getCustomerId()) ;
+		DataStream<Transaction> transactionStream = env.fromSource(transactionSource, WatermarkStrategy.noWatermarks(), "Kafka Transactions Topic").keyBy(transaction -> transaction.getCustomerId());
+		DataStream<Customer> customerStream = env.fromSource(customerSource, WatermarkStrategy.noWatermarks(), "Kafka Customer Topic").keyBy(customer -> customer.getCustomerId()) ;
 
-		// Join Transaction on customer to enrich data
-		transactionStream.connect(customerStream).flatMap(new EnrichmentFunction()).sinkTo(sink);
+		// Join Transaction on customer to enrich data and put it in new DataStream
+		DataStream<CustomerTransaction> customerTransactionDataStream = transactionStream.connect(customerStream).flatMap(new EnrichmentFunction());
 
-		transactionStream.print();
+		// Write to CustomerTransaction Topic
+		customerTransactionDataStream.sinkTo(sink);
+
+		// Write to Postgres Customer_Transaction Table
+		JdbcExecutionOptions executionOptions = new JdbcExecutionOptions.Builder()
+				.withBatchSize(1000)
+				.withBatchIntervalMs(200)
+				.withMaxRetries(5)
+				.build();
+
+		JdbcConnectionOptions connectionOptions = new JdbcConnectionOptions.JdbcConnectionOptionsBuilder()
+				.withUrl(JDBC_URL)
+				.withDriverName("org.postgresql.Driver")
+				.withUsername(POSTGRES_USERNAME)
+				.withPassword(POSTGRES_PASSWORD)
+				.build();
+
+		String sqlQuery = "CREATE TABLE IF NOT EXISTS Customer_Transactions (" +
+							"receipt_id VARCHAR PRIMARY KEY," +
+							"customer_id VARCHAR," +
+							"product_id VARCHAR, " +
+							"product_name VARCHAR, " +
+							"product_price DOUBLE PRECISION, " +
+							"product_quantity INTEGER, " +
+							"total_amount DOUBLE PRECISION, " +
+							"receipt_date TIMESTAMP, " +
+							"payment_method VARCHAR, " +
+							"customer_name VARCHAR, " +
+							"customer_email VARCHAR, " +
+							"customer_birthdate VARCHAR" +
+							")"
+				;
+
+		customerTransactionDataStream.addSink(JdbcSink.sink(
+				sqlQuery,
+				(JdbcStatementBuilder<CustomerTransaction>) (preparedState, customerTransaction) -> {
+
+				},
+				executionOptions,
+				connectionOptions
+		)).name("Create Customer Transaction Table Sink!");
+
+		customerTransactionDataStream.addSink(JdbcSink.sink(
+				"INSERT INTO Customer_Transactions (receipt_id, customer_id, product_id, product_name, " +
+					"product_price, product_quantity, total_amount, receipt_date, payment_method, " +
+					"customer_name, customer_email, customer_birthdate) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)" +
+					"ON CONFLICT (receipt_id) DO UPDATE SET " +
+						"receipt_id = EXCLUDED.receipt_id, " +
+						"customer_id = EXCLUDED.customer_id, " +
+						"product_id = EXCLUDED.product_id, " +
+						"product_name = EXCLUDED.product_name, " +
+						"product_price = EXCLUDED.product_price, " +
+						"product_quantity = EXCLUDED.product_quantity, " +
+						"total_amount = EXCLUDED.total_amount, " +
+						"receipt_date = EXCLUDED.receipt_date, " +
+						"payment_method = EXCLUDED.payment_method, " +
+						"customer_name = EXCLUDED.customer_name, " +
+						"customer_email = EXCLUDED.customer_email, " +
+						"customer_birthdate = EXCLUDED.customer_birthdate",
+				(JdbcStatementBuilder<CustomerTransaction>) (preparedStatement, customerTransaction) -> {
+					preparedStatement.setString(1, customerTransaction.getReceiptId());
+					preparedStatement.setString(2, customerTransaction.getCustomerId());
+					preparedStatement.setString(3, customerTransaction.getProductId());
+					preparedStatement.setString(4, customerTransaction.getProductName());
+					preparedStatement.setDouble(5, customerTransaction.getProductPrice());
+					preparedStatement.setInt(6, customerTransaction.getProductQuantity());
+					preparedStatement.setDouble(7, customerTransaction.getTotalAmount());
+					preparedStatement.setTimestamp(8, customerTransaction.getReceiptDate());
+					preparedStatement.setString(9, customerTransaction.getPaymentMethod());
+					preparedStatement.setString(10, customerTransaction.getCustomerName());
+					preparedStatement.setString(11, customerTransaction.getCustomerEmail());
+					preparedStatement.setString(12, customerTransaction.getCustomerBirthdate());
+				},
+				executionOptions,
+				connectionOptions
+		)).name("Insert into CustomerTransaction table Sink");
 
 		// Execute program, beginning computation.
 		env.execute("Kafka Flink Explore Job started!");
@@ -194,6 +282,27 @@ public class DataStreamJob {
 				transactionState.clear();
 				out.collect(new CustomerTransaction(customer, transaction));
 			}
+		}
+	}
+
+	public static class SumAmountSpend extends ProcessWindowFunction<
+			Transaction,                  // input type
+			Tuple3<String, Long, Float>,  // output type
+			String,                         // key type
+			TimeWindow> {                   // window type
+
+		@Override
+		public void process(
+				String key,
+				Context context,
+				Iterable<Transaction> transactions,
+				Collector<Tuple3<String, Long, Float>> out) {
+
+			float totalAmountSpend = 0;
+			for (Transaction transaction : transactions) {
+				totalAmountSpend += transaction.getTotalAmount();
+			}
+			out.collect(Tuple3.of(key, context.window().getEnd(), totalAmountSpend));
 		}
 	}
 }
